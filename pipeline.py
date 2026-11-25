@@ -1,361 +1,283 @@
 """
-pipeline.py -- end-to-end prototype (needs synth_digits.py in same folder)
+two_stage_detector.py
 
-  data -> Naive Bayes (from scratch) -> facts -> rule engine -> verdict
-  baseline = best single-feature threshold rule (no chi-square needed)
-
-Run:  python pipeline.py            (synthetic experiments, 5 seeds)
-      python pipeline.py --csv real.csv   (columns: person_id,label,sequence)
+Two-Stage Fake (Human-Generated) vs. Real (Uniform Random) 4-Digit Detector:
+  - Stage 1: Positional + Adjacent-Digram Naive Bayes (trained strictly on real human data)
+  - Stage 2: Shannon Entropy & Cross-Entropy Deviations (Digit bias, 1..4 repeat multiplicity, Benford's Law)
+  - Fusion : Gaussian likelihoods P(x | Fake) and P(x | Real) combined via the Law of Total Probability
 """
-import argparse
-import csv
+
 import math
 import random
 from collections import Counter
 
-import synth_digits as sd
-
-HUMAN, PRNG = "human", "prng"
-VOCAB_UNI = [f"d{i}" for i in range(10)]
-VOCAB_DI = [f"p{a}{b}" for a in range(10) for b in range(10)]
-
-
-# ------------------------------------------------------------------ data
-def weak_prng_sequence(rng, length):
-    """Bad PRNG: LCG mod 2^31, last decimal digit. Parity strictly alternates."""
-    x, out = rng.randrange(2 ** 31), []
-    for _ in range(length):
-        x = (1103515245 * x + 12345) % 2 ** 31
-        out.append(str(x % 10))
-    return "".join(out)
-
-
-def make_rows(rng, people, seqs, length, repeat_keep, uniform_humans=False,
-              prng_kind="good", sigma=0.25):
-    base = [0.1] * 10 if uniform_humans else sd.digit_weights()
-    rows = []
-    for p in range(people):
-        w = sd.personalize(rng, base, sigma)
-        for _ in range(seqs):
-            rows.append((f"h{p}", HUMAN,
-                         sd.human_sequence(rng, length, w, repeat_keep)))
-    for p in range(people):
-        for _ in range(seqs):
-            s = (sd.prng_sequence(rng, length) if prng_kind == "good"
-                 else weak_prng_sequence(rng, length))
-            rows.append((f"m{p}", PRNG, s))
-    return rows
-
-
-def split_by_person(rows, rng, test_frac=0.3):
-    """Whole people go to train OR test, stratified by class."""
-    train, test = [], []
-    for label in (HUMAN, PRNG):
-        people = sorted({r[0] for r in rows if r[1] == label})
-        rng.shuffle(people)
-        test_people = set(people[:max(1, int(len(people) * test_frac))])
-        for r in rows:
-            if r[1] == label:
-                (test if r[0] in test_people else train).append((r[2], r[1]))
-    return train, test
-
-
-# --------------------------------------------------------- Naive Bayes
-def tokens(seq, digrams=True):
-    t = ["d" + c for c in seq]
-    if digrams:
-        t += ["p" + a + b for a, b in zip(seq, seq[1:])]
-    return t
-
-
-class NaiveBayes:
-    def __init__(self, digrams=True, alpha=1.0):
-        self.digrams, self.alpha = digrams, alpha
-
-    def fit(self, data):
-        vocab = VOCAB_UNI + (VOCAB_DI if self.digrams else [])
-        self.logprior, self.loglik = {}, {}
-        for c in (HUMAN, PRNG):
-            seqs = [s for s, l in data if l == c]
-            self.logprior[c] = math.log(len(seqs) / len(data))
-            cnt = Counter(t for s in seqs for t in tokens(s, self.digrams))
-            total = sum(cnt.values())
-            denom = total + self.alpha * len(vocab)
-            self.loglik[c] = {t: math.log((cnt[t] + self.alpha) / denom)
-                              for t in vocab}
-        return self
-
-    def p_human(self, seq):
-        sc = {c: self.logprior[c] + sum(self.loglik[c][t]
-                                        for t in tokens(seq, self.digrams))
-              for c in (HUMAN, PRNG)}
-        m = max(sc.values())
-        e = {c: math.exp(v - m) for c, v in sc.items()}
-        return e[HUMAN] / (e[HUMAN] + e[PRNG])
-
-    def predict(self, seq):
-        return HUMAN if self.p_human(seq) >= 0.5 else PRNG
-
-
-# ----------------------------------------------------- features/baseline
-def seq_features(s):
-    n = len(s)
-    rep = sum(a == b for a, b in zip(s, s[1:])) / (n - 1)
-    share = max(Counter(s).values()) / n
-    zig = sum((a < b > c) or (a > b < c)
-              for a, b, c in zip(s, s[1:], s[2:])) / (n - 2)
-    return rep, share, zig
-
-
-class ThresholdBaseline:
-    """Best single-feature threshold rule, tuned on training data."""
-    NAMES = ["repeat_rate", "max_digit_share", "zigzag_rate"]
-
-    def fit(self, data):
-        F = [seq_features(s) for s, _ in data]
-        best = (-1, None)
-        for i in range(3):
-            vals = sorted(set(f[i] for f in F))
-            step = max(1, len(vals) // 40)
-            for thr in vals[::step]:
-                for sign in (1, -1):
-                    acc = sum(((sign * (f[i] - thr)) > 0) == (l == HUMAN)
-                              for f, (_, l) in zip(F, data)) / len(data)
-                    if acc > best[0]:
-                        best = (acc, (i, thr, sign))
-        self.i, self.thr, self.sign = best[1]
-        return self
-
-    def predict(self, seq):
-        return HUMAN if self.sign * (seq_features(seq)[self.i] - self.thr) > 0 \
-            else PRNG
-
-    def describe(self):
-        op = ">" if self.sign > 0 else "<"
-        return f"human if {self.NAMES[self.i]} {op} {self.thr:.3f}"
-
-
-# ------------------------------------------------------- rule engine
-# (layer, name, must-have facts, must-NOT-have facts, conclusion)
-# 'NOT' only refers to facts from lower layers, so each layer is a fixpoint.
-RULES = [
-    (1, "E1", ["avoids_repeats"], [], "some_evidence"),
-    (1, "E2", ["digit_favoritism"], [], "some_evidence"),
-    (1, "E3", ["over_alternates"], [], "some_evidence"),
-    (1, "E4", ["avoids_repeats", "digit_favoritism"], [], "strong_evidence"),
-    (1, "E5", ["avoids_repeats", "over_alternates"], [], "strong_evidence"),
-    (1, "E6", ["digit_favoritism", "over_alternates"], [], "strong_evidence"),
-    (2, "R1", ["length_short"], [], "weak_sample"),
-    (2, "R2", ["weak_sample", "posterior_high"], [], "unreliable_confidence"),
-    (3, "C1", ["posterior_high", "strong_evidence"], ["weak_sample"],
-     "likely_human_made"),
-    (3, "C2", ["posterior_high", "some_evidence"],
-     ["strong_evidence", "weak_sample"], "possible_human_made"),
-    (3, "C3", ["posterior_high"], ["some_evidence", "weak_sample"],
-     "conflict_review"),
-    (3, "C4", ["posterior_low", "strong_evidence"], ["weak_sample"],
-     "conflict_review"),
-    (3, "C5", ["posterior_low"], ["strong_evidence", "weak_sample"],
-     "likely_machine_random"),
-    (3, "C6", ["weak_sample"], [], "inconclusive"),
-    (3, "C7", ["uncertain"], [], "inconclusive"),
-    (4, "A1", ["likely_human_made"], [], "action_flag_for_review"),
-    (4, "A2", ["possible_human_made"], [], "action_flag_for_review"),
-    (4, "A3", ["inconclusive"], [], "action_collect_more_entries"),
-    (4, "A4", ["conflict_review"], [], "action_manual_check"),
+# Actual human data ONLY (4 rows x 10 numbers = 40 four-digit numbers)
+HUMAN_ROWS = [
+    ["2345", "8645", "6432", "1853", "5319", "7601", "3427", "6459", "1394", "8271"],
+    ["1004", "8030", "3030", "1234", "2004", "1974", "1972", "4010", "2013", "2026"],
+    ["1352", "1673", "7640", "6754", "2421", "3452", "9068", "8923", "5623", "7845"],
+    ["3791", "2916", "1062", "9971", "2751", "1023", "5495", "9205", "9022", "6391"],
 ]
-VERDICTS = ["likely_human_made", "possible_human_made", "likely_machine_random",
-            "conflict_review", "inconclusive"]
+HUMAN_DATA = [num for row in HUMAN_ROWS for num in row]
+
+DIGITS = "0123456789"
+FIRST_DIGITS = "123456789"
+MULTS = [1, 2, 3, 4]  # Max count of any repeated digit in a 4-digit number
+
+UNIF_DIGIT = {d: 0.1 for d in DIGITS}
+BENFORD = {str(d): math.log10(1.0 + 1.0 / d) for d in range(1, 10)}
+
+# Exact multiplicity distribution for uniform 4-digit integers in 1000..9999 (9000 total)
+RAND_MULT = {1: 4536 / 9000, 2: 4131 / 9000, 3: 324 / 9000, 4: 9 / 9000}
 
 
-def run_engine(facts):
-    facts, trace = set(facts), []
-    for layer in sorted({r[0] for r in RULES}):
-        changed = True
-        while changed:
-            changed = False
-            for ly, name, req, forb, concl in RULES:
-                if (ly == layer and concl not in facts
-                        and all(r in facts for r in req)
-                        and not any(f in facts for f in forb)):
-                    facts.add(concl)
-                    trace.append(f"{name}: {' & '.join(req)}"
-                                 + (f" & not({','.join(forb)})" if forb else "")
-                                 + f" => {concl}")
-                    changed = True
-    return facts, trace
+def max_multiplicity(num_str: str) -> int:
+    return max(Counter(num_str).values())
 
 
-def pct(vals, q):
-    s = sorted(vals)
-    return s[min(len(s) - 1, int(q * len(s)))]
+def empirical_dist(items, keys, alpha: float = 0.0) -> dict:
+    counts = Counter(items)
+    denom = len(items) + alpha * len(keys)
+    return {k: (counts[k] + alpha) / denom for k in keys}
 
 
-class RuleLayer:
-    """Thresholds come from PRNG training data (10% tails), not guesses."""
+def shannon_entropy(p: dict) -> float:
+    return -sum(v * math.log2(v) for v in p.values() if v > 0)
 
-    def fit(self, train):
-        F = [seq_features(s) for s, l in train if l == PRNG]
-        self.rep_lo = pct([f[0] for f in F], 0.10)
-        self.share_hi = pct([f[1] for f in F], 0.90)
-        self.zig_hi = pct([f[2] for f in F], 0.90)
+
+def cross_entropy(p: dict, q: dict) -> float:
+    return -sum(p[k] * math.log2(q[k]) for k in p if p[k] > 0)
+
+
+def normal_pdf(x: float, mu: float, sigma: float) -> float:
+    sigma = max(sigma, 1e-6)
+    z = (x - mu) / sigma
+    return math.exp(-0.5 * z * z) / (sigma * math.sqrt(2.0 * math.pi))
+
+
+def mean_std(values) -> tuple[float, float]:
+    mu = sum(values) / len(values)
+    var = sum((v - mu) ** 2 for v in values) / max(1, len(values) - 1)
+    return mu, math.sqrt(var)
+
+
+# ==============================================================================
+# STAGE 1: Positional + Digram Naive Bayes (Human vs. Exact Uniform 1000..9999)
+# ==============================================================================
+class Stage1NaiveBayes:
+    def __init__(self, alpha: float = 1.0, digram_weight: float = 0.5):
+        self.alpha = alpha
+        self.digram_weight = digram_weight
+
+    def fit(self, human_seqs: list[str]):
+        self.pos_counts = [Counter() for _ in range(4)]
+        self.di_counts = Counter()
+        for s in human_seqs:
+            for pos, ch in enumerate(s):
+                self.pos_counts[pos][ch] += 1
+            for a, b in zip(s, s[1:]):
+                self.di_counts[a + b] += 1
+        self.n_seqs = len(human_seqs)
+        self.n_di = self.n_seqs * 3
         return self
 
-    def facts(self, seq, p_human):
-        rep, share, zig = seq_features(seq)
-        f = set()
-        if p_human >= 0.8: f.add("posterior_high")
-        elif p_human <= 0.2: f.add("posterior_low")
-        else: f.add("uncertain")
-        if len(seq) < 10: f.add("length_short")
-        if rep <= self.rep_lo: f.add("avoids_repeats")
-        if share >= self.share_hi: f.add("digit_favoritism")
-        if zig >= self.zig_hi: f.add("over_alternates")
-        return f
+    def sequence_llr(self, s: str) -> float:
+        """Log2 likelihood ratio: log2 P(s | Human_NB) - log2 P(s | Uniform)."""
+        lp_human, lp_rand = 0.0, 0.0
+        for pos, ch in enumerate(s):
+            k_choices = 9 if pos == 0 else 10  # Leading digit is 1..9; others 0..9
+            p_h = (self.pos_counts[pos][ch] + self.alpha) / (self.n_seqs + self.alpha * k_choices)
+            p_r = 1.0 / k_choices
+            lp_human += math.log2(p_h)
+            lp_rand += math.log2(p_r)
 
-    def verdict(self, seq, p_human):
-        facts, trace = run_engine(self.facts(seq, p_human))
-        v = next((x for x in VERDICTS if x in facts), "inconclusive")
-        return v, trace
+        for a, b in zip(s, s[1:]):
+            p_h_di = (self.di_counts[a + b] + 0.5) / (self.n_di + 0.5 * 100)
+            p_r_di = 0.01
+            lp_human += self.digram_weight * math.log2(p_h_di)
+            lp_rand += self.digram_weight * math.log2(p_r_di)
 
+        return lp_human - lp_rand
 
-# --------------------------------------------------------- evaluation
-def confusion(y, p):
-    tp = sum(a == HUMAN and b == HUMAN for a, b in zip(y, p))
-    fn = sum(a == HUMAN and b == PRNG for a, b in zip(y, p))
-    fp = sum(a == PRNG and b == HUMAN for a, b in zip(y, p))
-    tn = sum(a == PRNG and b == PRNG for a, b in zip(y, p))
-    return tp, fn, fp, tn
+    def batch_score(self, batch: list[str]) -> float:
+        return sum(self.sequence_llr(s) for s in batch) / len(batch)
 
-
-def acc(c):
-    return (c[0] + c[3]) / max(1, sum(c))
+    def predict_proba_fake(self, batch: list[str], prior_fake: float = 0.5) -> float:
+        total_llr = sum(self.sequence_llr(s) for s in batch)
+        log_odds = total_llr + math.log2(prior_fake / (1.0 - prior_fake))
+        log_odds = max(-50.0, min(50.0, log_odds))
+        return 1.0 / (1.0 + 2.0 ** (-log_odds))
 
 
-def evaluate(train, test):
-    nb = NaiveBayes(True).fit(train)
-    nb_uni = NaiveBayes(False).fit(train)
-    base = ThresholdBaseline().fit(train)
-    rl = RuleLayer().fit(train)
-    y = [l for _, l in test]
-    out = {"nb": confusion(y, [nb.predict(s) for s, _ in test]),
-           "nb_uni": confusion(y, [nb_uni.predict(s) for s, _ in test]),
-           "base": confusion(y, [base.predict(s) for s, _ in test])}
-    dec_y, dec_p, n_dec = [], [], 0
-    for s, l in test:
-        v, _ = rl.verdict(s, nb.p_human(s))
-        if v in ("likely_human_made", "possible_human_made"):
-            dec_y.append(l); dec_p.append(HUMAN)
-        elif v == "likely_machine_random":
-            dec_y.append(l); dec_p.append(PRNG)
-    out["rules"] = confusion(dec_y, dec_p)
-    out["coverage"] = len(dec_y) / len(test)
-    out["base_rule"] = base.describe()
-    return out, (nb, base, rl)
+# ==============================================================================
+# STAGE 2 + FUSION: Cross-Entropy Deviations + Law of Total Probability
+# ==============================================================================
+class TwoStageFakeDetector:
+    """
+    Combines Stage 1 (Naive Bayes LLR) and Stage 2 (Cross-Entropy Deviations)
+    using Normal likelihoods and the Law of Total Probability:
+        P(x) = P(x | Fake) * P(Fake) + P(x | Real) * P(Real)
+        P(Fake | x) = [P(x | Fake) * P(Fake)] / P(x)
+    """
+
+    def __init__(self, prior_fake: float = 0.5, active_indices: tuple[int, ...] = (0, 1, 2, 3)):
+        self.prior_fake = prior_fake
+        self.prior_real = 1.0 - prior_fake
+        # Feature indices: 0=Stage1_NB, 1=Digit_CE, 2=Multiplicity_CE, 3=Benford_CE
+        self.active_indices = active_indices
+
+    @staticmethod
+    def _compute_vector(
+        batch: list[str],
+        nb_model: Stage1NaiveBayes,
+        q_human_digit: dict,
+        q_human_mult: dict,
+    ) -> list[float]:
+        # Stage 1 feature: Mean Naive Bayes log-likelihood ratio
+        s1_nb = nb_model.batch_score(batch)
+
+        # Stage 2a: Digit cross-entropy deviation H(P, Q_human) - H(P, Uniform)
+        p_dig = empirical_dist("".join(batch), DIGITS, alpha=0.0)
+        dev_digit = cross_entropy(p_dig, q_human_digit) - math.log2(10)
+
+        # Stage 2b: Same-digit multiplicity (1..4 repeats) cross-entropy deviation
+        p_mult = empirical_dist([max_multiplicity(s) for s in batch], MULTS, alpha=0.0)
+        dev_mult = cross_entropy(p_mult, q_human_mult) - cross_entropy(p_mult, RAND_MULT)
+
+        # Stage 2c: Benford's Law leading-digit cross-entropy deviation
+        p_first = empirical_dist([s[0] for s in batch], FIRST_DIGITS, alpha=0.0)
+        dev_benford = cross_entropy(p_first, BENFORD) - math.log2(9)
+
+        return [s1_nb, dev_digit, dev_mult, dev_benford]
+
+    def fit(self, human_train_batches: list[list[str]], rng: random.Random, null_samples: int = 500):
+        batch_size = len(human_train_batches[0])
+        flat_human = [num for b in human_train_batches for num in b]
+
+        # Fit final Stage 1 NB and Stage 2 reference distributions on full human training split
+        self.nb = Stage1NaiveBayes(alpha=1.0).fit(flat_human)
+        self.q_human_digit = empirical_dist("".join(flat_human), DIGITS, alpha=1.0)
+        self.q_human_mult = empirical_dist([max_multiplicity(s) for s in flat_human], MULTS, alpha=0.5)
+
+        # Fit P(x | Fake) Gaussians via internal leave-one-batch-out so NB/CE scores aren't overfit
+        fake_matrix = []
+        for idx_b, target_batch in enumerate(human_train_batches):
+            sub_flat = [num for j, b in enumerate(human_train_batches) if j != idx_b for num in b]
+            sub_nb = Stage1NaiveBayes(alpha=1.0).fit(sub_flat)
+            sub_q_dig = empirical_dist("".join(sub_flat), DIGITS, alpha=1.0)
+            sub_q_mult = empirical_dist([max_multiplicity(s) for s in sub_flat], MULTS, alpha=0.5)
+            fake_matrix.append(self._compute_vector(target_batch, sub_nb, sub_q_dig, sub_q_mult))
+
+        self.fake_gaussians = [mean_std(col) for col in zip(*fake_matrix)]
+
+        # Fit P(x | Real) Gaussians on true uniform random batches
+        real_batches = [
+            [str(rng.randint(1000, 9999)) for _ in range(batch_size)]
+            for _ in range(null_samples)
+        ]
+        real_matrix = [
+            self._compute_vector(b, self.nb, self.q_human_digit, self.q_human_mult)
+            for b in real_batches
+        ]
+        self.real_gaussians = [mean_std(col) for col in zip(*real_matrix)]
+        return self
+
+    def predict_proba_fake(self, batch: list[str]) -> float:
+        x = self._compute_vector(batch, self.nb, self.q_human_digit, self.q_human_mult)
+
+        log_lik_fake = sum(
+            math.log(max(normal_pdf(x[i], self.fake_gaussians[i][0], self.fake_gaussians[i][1]), 1e-300))
+            for i in self.active_indices
+        )
+        log_lik_real = sum(
+            math.log(max(normal_pdf(x[i], self.real_gaussians[i][0], self.real_gaussians[i][1]), 1e-300))
+            for i in self.active_indices
+        )
+
+        # Law of Total Probability: P(x) = P(x|Fake)P(Fake) + P(x|Real)P(Real)
+        a = log_lik_fake + math.log(self.prior_fake)
+        b = log_lik_real + math.log(self.prior_real)
+        m = max(a, b)
+        p_x_and_fake = math.exp(a - m)
+        p_x_total = p_x_and_fake + math.exp(b - m)
+        return p_x_and_fake / p_x_total
+
+    def inspect(self, batch: list[str]) -> dict:
+        x = self._compute_vector(batch, self.nb, self.q_human_digit, self.q_human_mult)
+        return {
+            "stage1_nb_prob": round(self.nb.predict_proba_fake(batch, self.prior_fake), 4),
+            "stage1_nb_llr": round(x[0], 4),
+            "stage2_digit_ce_dev": round(x[1], 4),
+            "stage2_mult_ce_dev": round(x[2], 4),
+            "stage2_benford_ce_dev": round(x[3], 4),
+            "final_p_fake": round(self.predict_proba_fake(batch), 4),
+        }
 
 
-def add(c1, c2):
-    return tuple(a + b for a, b in zip(c1, c2))
+# ==============================================================================
+# K-Fold Cross-Validation Benchmark (Stage 1 vs. Stage 2 vs. Combined)
+# ==============================================================================
+def benchmark_kfold(batch_size: int = 5, k_folds: int = 4, n_seeds: int = 20):
+    acc_s1, acc_s2, acc_both = [], [], []
 
+    for seed in range(n_seeds):
+        rng = random.Random(500 + seed)
+        h_batches = [HUMAN_DATA[i : i + batch_size] for i in range(0, len(HUMAN_DATA), batch_size)]
+        n = len(h_batches)
+        r_batches = [[str(rng.randint(1000, 9999)) for _ in range(batch_size)] for _ in range(n)]
 
-def run_grid(seeds, people, seqs):
-    grid = [(f"E{i + 1 + (0 if rk == 1.0 else 5)}", L, rk)
-            for rk in (1.0, 0.3) for i, L in enumerate((4, 8, 12, 20, 40))]
-    print(f"{'exp':4s} {'len':>3s} {'repeat_keep':>11s} | {'NB uni+di':>9s} "
-          f"{'NB uni':>7s} {'baseline':>8s} | {'rules acc':>9s} {'coverage':>8s}")
-    totals = {}
-    for name, L, rk in grid:
-        agg = {k: (0, 0, 0, 0) for k in ("nb", "nb_uni", "base", "rules")}
-        cov = 0
-        for sd_ in range(seeds):
-            rng = random.Random(1000 * sd_ + L)
-            rows = make_rows(rng, people, seqs, L, rk)
-            res, _ = evaluate(*split_by_person(rows, rng))
-            for k in agg:
-                agg[k] = add(agg[k], res[k])
-            cov += res["coverage"] / seeds
-        totals[name] = agg
-        rules_acc = f"{acc(agg['rules']):9.3f}" if cov > 0 else f"{'n/a':>9s}"
-        print(f"{name:4s} {L:3d} {rk:11.1f} | {acc(agg['nb']):9.3f} "
-              f"{acc(agg['nb_uni']):7.3f} {acc(agg['base']):8.3f} | "
-              f"{rules_acc} {cov:8.2f}")
-    return totals
+        idx = list(range(n))
+        rng.shuffle(idx)
+        folds = [idx[i::k_folds] for i in range(k_folds)]
 
+        c1 = c2 = cb = total = 0
+        for f in range(k_folds):
+            tr_h = [h_batches[i] for j in range(k_folds) if j != f for i in folds[j]]
+            te_h = [h_batches[i] for i in folds[f]]
+            te_r = [r_batches[i] for i in folds[f]]
 
-def run_failure_cases(seeds, people, seqs):
-    """Train on the standard condition, test on shifted/bad conditions."""
-    print("\nFAILURE / SHIFT CASES (train: length 20, repeat_keep 0.3)")
-    cases = [
-        ("F1 humans try to be uniform", dict(uniform_humans=True, repeat_keep=0.3)),
-        ("F2 weak LCG instead of good PRNG", dict(prng_kind="weak", repeat_keep=0.3)),
-        ("F3 humans never avoid repeats", dict(repeat_keep=1.0)),
-    ]
-    print(f"{'case':34s} {'NB':>6s} {'baseline':>8s} {'rules acc':>9s}")
-    for name, kw in cases:
-        agg = {k: (0, 0, 0, 0) for k in ("nb", "base", "rules")}
-        for sd_ in range(seeds):
-            rng = random.Random(7000 + sd_)
-            tr_rows = make_rows(rng, people, seqs, 20, 0.3)
-            train, _ = split_by_person(tr_rows, rng)
-            nb = NaiveBayes(True).fit(train)
-            base = ThresholdBaseline().fit(train)
-            rl = RuleLayer().fit(train)
-            args = dict(repeat_keep=0.3); args.update(kw)
-            te_rows = make_rows(rng, people, seqs, 20, **args)
-            _, test = split_by_person(te_rows, rng, test_frac=0.5)
-            y = [l for _, l in test]
-            agg["nb"] = add(agg["nb"], confusion(y, [nb.predict(s) for s, _ in test]))
-            agg["base"] = add(agg["base"], confusion(y, [base.predict(s) for s, _ in test]))
-            dy, dp = [], []
-            for s, l in test:
-                v, _ = rl.verdict(s, nb.p_human(s))
-                if v in ("likely_human_made", "possible_human_made"):
-                    dy.append(l); dp.append(HUMAN)
-                elif v == "likely_machine_random":
-                    dy.append(l); dp.append(PRNG)
-            agg["rules"] = add(agg["rules"], confusion(dy, dp))
-        print(f"{name:34s} {acc(agg['nb']):6.3f} {acc(agg['base']):8.3f} "
-              f"{acc(agg['rules']):9.3f}   (NB human recall "
-              f"{agg['nb'][0] / max(1, agg['nb'][0] + agg['nb'][1]):.2f}, "
-              f"machine recall {agg['nb'][3] / max(1, agg['nb'][2] + agg['nb'][3]):.2f})")
+            # Fit once per fold, evaluate Stage 1 only (0,), Stage 2 only (1,2,3), and Both (0,1,2,3)
+            model = TwoStageFakeDetector(prior_fake=0.5, active_indices=(0, 1, 2, 3)).fit(tr_h, rng)
 
+            for true_label, test_batches in [(1, te_h), (0, te_r)]:
+                for b in test_batches:
+                    model.active_indices = (0,)
+                    c1 += int((model.predict_proba_fake(b) >= 0.5) == true_label)
 
-def demo(rng):
-    print("\nDEMO: derived verdict with rule trace")
-    train, _ = split_by_person(make_rows(rng, 60, 5, 20, 0.3), rng)
-    nb, rl = NaiveBayes(True).fit(train), RuleLayer().fit(train)
-    for label, s in [("your 28 digits", "1928729356215297825739498678"),
-                     ("fresh PRNG", sd.prng_sequence(rng, 20))]:
-        p = nb.p_human(s)
-        v, trace = rl.verdict(s, p)
-        print(f"\n[{label}] P(human)={p:.3f} -> {v}")
-        for t in trace:
-            print("   ", t)
+                    model.active_indices = (1, 2, 3)
+                    c2 += int((model.predict_proba_fake(b) >= 0.5) == true_label)
 
+                    model.active_indices = (0, 1, 2, 3)
+                    cb += int((model.predict_proba_fake(b) >= 0.5) == true_label)
+                    total += 1
 
-def run_csv(path):
-    rows = [(r["person_id"], r["label"], r["sequence"])
-            for r in csv.DictReader(open(path))]
-    rng = random.Random(0)
-    res, (_, base, _) = evaluate(*split_by_person(rows, rng))
-    print(f"NB acc={acc(res['nb']):.3f}  baseline acc={acc(res['base']):.3f} "
-          f"({res['base_rule']})  confusion(tp,fn,fp,tn)={res['nb']}")
+        acc_s1.append(c1 / total)
+        acc_s2.append(c2 / total)
+        acc_both.append(cb / total)
+
+    return sum(acc_s1) / n_seeds, sum(acc_s2) / n_seeds, sum(acc_both) / n_seeds
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--seeds", type=int, default=5)
-    ap.add_argument("--people", type=int, default=60)
-    ap.add_argument("--seqs-per-person", type=int, default=5)
-    ap.add_argument("--csv")
-    a = ap.parse_args()
-    if a.csv:
-        run_csv(a.csv)
-    else:
-        t = run_grid(a.seeds, a.people, a.seqs_per_person)
-        for k in ("E4", "E9"):
-            tp, fn, fp, tn = t[k]["nb"]
-            print(f"\nNB confusion {k} (summed over seeds): "
-                  f"TP={tp} FN={fn} FP={fp} TN={tn}")
-        run_failure_cases(a.seeds, a.people, a.seqs_per_person)
-        demo(random.Random(123))
+    print("=== Two-Stage K-Fold Cross-Validation (20 Seeds, Real Human Data Only) ===")
+    for bs, kf in [(1, 5), (5, 4), (10, 4)]:
+        s1, s2, both = benchmark_kfold(batch_size=bs, k_folds=kf, n_seeds=20)
+        print(
+            f"Batch size = {bs:2d} ({kf}-fold): "
+            f"Stage 1 NB = {s1:.3f} | Stage 2 CE = {s2:.3f} | Combined P(Fake) = {both:.3f}"
+        )
+
+    # Full-model inspection on a human-like batch vs. a random batch
+    rng_demo = random.Random(99)
+    detector = TwoStageFakeDetector(prior_fake=0.5).fit(
+        [HUMAN_DATA[i : i + 5] for i in range(0, 40, 5)], rng_demo
+    )
+
+    human_like = ["1984", "2019", "4729", "8361", "5104"]
+    true_random = [str(rng_demo.randint(1000, 9999)) for _ in range(5)]
+
+    print("\n=== Stage-by-Stage Inspection ===")
+    print("Suspect batch:", human_like)
+    print("  ->", detector.inspect(human_like))
+    print("Random batch :", true_random)
+    print("  ->", detector.inspect(true_random))
